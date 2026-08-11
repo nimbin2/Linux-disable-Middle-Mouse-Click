@@ -64,7 +64,7 @@ You need the **libudev** development headers (package `libudev-dev` on Debian/Ub
 `systemd-devel` on Fedora, etc.).
 
 ```bash
-gcc -Wall -O2 -D_GNU_SOURCE -o middle-disable middle-disable.c -ludev
+gcc -Wall -O2 -D_GNU_SOURCE -o middle_button_disable middle_button_disable.c -ludev
 ```
 
 The binary must be run **as root** (or with the `CAP_SYS_ADMIN` capability)
@@ -80,16 +80,16 @@ because it needs to:
 ### 1. Manual start (for testing)
 
 ```bash
-sudo ./middle-disable --auto
+sudo ./middle_button_disable --auto
 # or
-sudo ./middle-disable -d /dev/input/event13 -d /dev/input/event15
+sudo ./middle_button_disable -d /dev/input/event13 -d /dev/input/event15
 ```
 
 Press **Ctrl‑C** to stop – the program cleans up the uinput nodes and releases the grabs.
 
 ### 2. Systemd service (run at boot)
 
-Create `/etc/systemd/system/middle-disable.service`:
+Create `/etc/systemd/system/middle_button_disable.service`:
 
 ```ini
 [Unit]
@@ -99,7 +99,7 @@ Wants=systemd-udevd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/middle-disable --auto
+ExecStart=/usr/local/sbin/middle_button_disable --auto
 # change the path if you installed it elsewhere
 Restart=on-failure
 CapabilityBoundingSet=CAP_SYS_ADMIN
@@ -114,23 +114,23 @@ Enable and start it:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now middle-disable.service
+sudo systemctl enable --now middle_button_disable.service
 ```
 
 Check the log:
 
 ```bash
-journalctl -u middle-disable -f
+journalctl -u middle_button_disable -f
 ```
 
 ### 3. SysV init (sysvinit / sysv-rc / Devuan, etc.)
 
-Create `/etc/init.d/middle-disable`:
+Create `/etc/init.d/middle_button_disable`:
 
 ```sh
 #!/bin/sh
 ### BEGIN INIT INFO
-# Provides:          middle-disable
+# Provides:          middle_button_disable
 # Required-Start:    $local_fs $remote_fs udev
 # Required-Stop:     $local_fs $remote_fs
 # Default-Start:     2 3 4 5
@@ -138,8 +138,8 @@ Create `/etc/init.d/middle-disable`:
 # Short-Description: Disable TrackPoint middle click (keep scrolling)
 ### END INIT INFO
 
-DAEMON=/usr/local/sbin/middle-disable
-NAME=middle-disable
+DAEMON=/usr/local/sbin/middle_button_disable
+NAME=middle_button_disable
 PIDFILE=/run/$NAME.pid
 
 # Choose ONE:
@@ -184,23 +184,23 @@ exit 0
 Enable it (Debian/Devuan style):
 
 ```bash
-sudo chmod +x /etc/init.d/middle-disable
-sudo update-rc.d middle-disable defaults
-sudo service middle-disable start
+sudo chmod +x /etc/init.d/middle_button_disable
+sudo update-rc.d middle_button_disable defaults
+sudo service middle_button_disable start
 ```
 
 On some distros you may use chkconfig instead of update-rc.d.
 
 ### 4. OpenRC
 
-Create `/etc/init.d/middle-disable`:  
+Create `/etc/init.d/middle_button_disable`:  
 ```bash
 #!/sbin/openrc-run
 
-name="middle-disable"
+name="middle_button_disable"
 description="Disable TrackPoint middle click (keep scrolling)"
 
-command="/usr/local/sbin/middle-disable"
+command="/usr/local/sbin/middle_button_disable"
 
 # Choose ONE:
 command_args="--auto"
@@ -218,9 +218,9 @@ depend() {
 Enable and start:
 
 ```bash
-sudo chmod +x /etc/init.d/middle-disable
-sudo rc-update add middle-disable default
-sudo rc-service middle-disable start
+sudo chmod +x /etc/init.d/middle_button_disable
+sudo rc-update add middle_button_disable default
+sudo rc-service middle_button_disable start
 ```
 
 ---

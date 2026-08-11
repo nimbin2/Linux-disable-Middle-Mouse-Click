@@ -4,7 +4,7 @@
  *  (c) 2024 100 % vibecode – feel free to copy, hack and share
  *
  *  Build (needs libudev, POSIX regex is in libc):
- *      gcc -Wall -O2 -D_GNU_SOURCE -o middle-disable middle-disable.c -ludev
+ *      gcc -Wall -O2 -D_GNU_SOURCE -o middle_button_disable middle_button_disable.c -ludev
  *
  *  New command‑line interface
  *      -d /dev/input/eventX          (repeatable)
@@ -300,7 +300,7 @@ static void usage(const char *progname)
         "  $ libinput debug-events | grep -i \"trackpoint\"\n"
         "\n"
         "Compile (needs libudev, POSIX regex is in libc):\n"
-        "  gcc -Wall -O2 -D_GNU_SOURCE -o middle-disable middle-disable.c -ludev\n"
+        "  gcc -Wall -O2 -D_GNU_SOURCE -o middle_button_disable middle_button_disable.c -ludev\n"
         "\n"
         "Run as root (or with CAP_SYS_ADMIN).\n"
         "\n"
