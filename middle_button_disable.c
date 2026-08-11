@@ -1,45 +1,52 @@
 /*=====================================================================
- *  middle‑disable.c – disable TrackPoint middle‑click, keep scrolling
+ *  middle-disable.c – disable TrackPoint middle-click, keep scrolling
  *
- *  (c) 2024 100 % vibecode – feel free to copy, hack and share
+ *  (c) 2024 100 % vibecode – feel free to copy, hack and share
  *
  *  Build (needs libudev, POSIX regex is in libc):
- *      gcc -Wall -O2 -D_GNU_SOURCE -o middle_button_disable middle_button_disable.c -ludev
+ *      gcc -Wall -O2 -D_GNU_SOURCE -o middle_button_disable middle-disable.c -ludev
  *
- *  New command‑line interface
+ *  CLI:
  *      -d /dev/input/eventX          (repeatable)
- *      --auto                       auto‑detect all TrackPoints
- *      --match <regex>              optional additional filter on the device
- *                                   model name (case‑insensitive POSIX regex)
- *      -h / --help                  Show help.
+ *      --auto                       auto-detect TrackPoints (+ hotplug)
+ *      --match <regex>              optional filter on ID_MODEL (case-insensitive POSIX regex)
+ *      --vendor <hex>               optional filter on ID_VENDOR_ID (only if property exists)
+ *      --product <hex>              optional filter on ID_MODEL_ID (only if property exists)
+ *      -h / --help                  show help
  *
- *  The README (at the end of this file) explains how to discover the
- *  right eventX names, how to install a systemd service, etc.
+ *  Important fix:
+ *    We MUST ignore the uinput devices we create ourselves, otherwise udev
+ *    hotplug will see them as new pointingsticks and we recurse forever
+ *    (event numbers skyrocketing like event256, event257, ...).
+ *    We exclude /sys/devices/virtual/\* (uinput) devices and also give our
+ *    uinput a distinctive name prefix.
  *====================================================================*/
 
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE               /* must be defined before any header */
+#define _GNU_SOURCE
 #endif
 
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
 #include <poll.h>
+#include <regex.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-#include <getopt.h>
+
 #include <libudev.h>
-#include <regex.h>
 
 /* -----------------------------------------------------------------
  *  Constants & helper macros
  * ----------------------------------------------------------------- */
-#define MAX_DEVICES 32            /* plenty for any laptop */
+#define MAX_DEVICES 32
+#define UINPUT_NAME_PREFIX "middle-disable: "
 
 static inline int test_bit(unsigned int nr, const unsigned long *addr)
 {
@@ -48,15 +55,25 @@ static inline int test_bit(unsigned int nr, const unsigned long *addr)
 }
 
 /* -----------------------------------------------------------------
- *  Device description (one entry per filtered device)
+ *  Device description
  * ----------------------------------------------------------------- */
 struct device {
-    const char *path;          /* /dev/input/eventX */
-    const char *name;          /* name shown in /dev/input */
-    int  fd;                   /* fd of the real grabbed device */
-    int  ufd;                  /* fd of the uinput virtual device */
-    int  middle_down;          /* BTN_MIDDLE is currently pressed */
-    int  middle_sent;          /* we already emitted a synthetic press */
+    char *path;                 /* strdup()ed, e.g. /dev/input/eventX */
+    char *name;                 /* strdup()ed source device name (for logs) */
+    int  fd;                    /* fd of the real grabbed device */
+    int  ufd;                   /* fd of the uinput virtual device */
+    int  middle_down;           /* BTN_MIDDLE currently pressed */
+    int  middle_sent;           /* we already emitted a synthetic press */
+};
+
+/* -----------------------------------------------------------------
+ *  Filters (applied to --auto and hotplug)
+ * ----------------------------------------------------------------- */
+struct filters {
+    const char *vendor_id;      /* hex, e.g. "17ef" (only if udev property exists) */
+    const char *product_id;     /* hex, e.g. "60ee" (only if udev property exists) */
+    int have_regex;
+    regex_t regex;
 };
 
 /* -----------------------------------------------------------------
@@ -66,15 +83,15 @@ static volatile sig_atomic_t running = 1;
 static void stop_handler(int sig) { (void)sig; running = 0; }
 
 /* -----------------------------------------------------------------
- *  uinput helpers (identical to your original implementation)
+ *  uinput emit helpers
  * ----------------------------------------------------------------- */
 static int emit_event(struct device *dev, const struct input_event *ev)
 {
     ssize_t n = write(dev->ufd, ev, sizeof(*ev));
     return (n == sizeof(*ev)) ? 0 : -1;
 }
-static int emit_key(struct device *dev,
-                    const struct input_event *src,
+
+static int emit_key(struct device *dev, const struct input_event *src,
                     int code, int value)
 {
     struct input_event ev = *src;
@@ -85,7 +102,7 @@ static int emit_key(struct device *dev,
 }
 
 /* -----------------------------------------------------------------
- *  Create the uinput virtual device (mirrors the capabilities we need)
+ *  Create uinput device
  * ----------------------------------------------------------------- */
 static int create_uinput(struct device *dev)
 {
@@ -102,36 +119,38 @@ static int create_uinput(struct device *dev)
         ioctl(dev->ufd, UI_SET_KEYBIT, BTN_MIDDLE) < 0)
         return -1;
 
-    if (ioctl(dev->ufd, UI_SET_RELBIT, REL_X)                < 0 ||
-        ioctl(dev->ufd, UI_SET_RELBIT, REL_Y)                < 0 ||
-        ioctl(dev->ufd, UI_SET_RELBIT, REL_WHEEL)            < 0 ||
-        ioctl(dev->ufd, UI_SET_RELBIT, REL_HWHEEL)           < 0 ||
-        ioctl(dev->ufd, UI_SET_RELBIT, REL_WHEEL_HI_RES)     < 0 ||
-        ioctl(dev->ufd, UI_SET_RELBIT, REL_HWHEEL_HI_RES)    < 0)
+    if (ioctl(dev->ufd, UI_SET_RELBIT, REL_X)             < 0 ||
+        ioctl(dev->ufd, UI_SET_RELBIT, REL_Y)             < 0 ||
+        ioctl(dev->ufd, UI_SET_RELBIT, REL_WHEEL)         < 0 ||
+        ioctl(dev->ufd, UI_SET_RELBIT, REL_HWHEEL)        < 0 ||
+        ioctl(dev->ufd, UI_SET_RELBIT, REL_WHEEL_HI_RES)  < 0 ||
+        ioctl(dev->ufd, UI_SET_RELBIT, REL_HWHEEL_HI_RES) < 0)
         return -1;
 
+    /* Mark as virtual so we can reliably exclude it from --auto/hotplug */
     struct uinput_setup setup = {
         .id = {
-            .bustype = BUS_USB,
-            .vendor  = 0x17ef,
-            .product = 0x60ee,
+            .bustype = BUS_VIRTUAL,
+            .vendor  = 0xfeed,
+            .product = 0x0001,
             .version = 1
         }
     };
-    snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "%s", dev->name);
+
+    const char *srcname = dev->name ? dev->name : "TrackPoint";
+    snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "%s%s", UINPUT_NAME_PREFIX, srcname);
 
     if (ioctl(dev->ufd, UI_DEV_SETUP, &setup) < 0) return -1;
     if (ioctl(dev->ufd, UI_DEV_CREATE, 0)    < 0) return -1;
 
-    usleep(100000);   /* give the kernel a moment to create the node */
+    usleep(100000);
     return 0;
 }
 
 /* -----------------------------------------------------------------
- *  Event processing – internal (built‑in) vs external keyboards
+ *  Event processing: Disable plain middle-click, keep scroll behavior
  * ----------------------------------------------------------------- */
-static void process_internal(struct device *dev,
-                             const struct input_event *ev)
+static void process_trackpoint(struct device *dev, const struct input_event *ev)
 {
     if (ev->type == EV_KEY && ev->code == BTN_MIDDLE) {
         if (ev->value == 1) { dev->middle_down = 1; return; }
@@ -141,7 +160,7 @@ static void process_internal(struct device *dev,
             dev->middle_sent = 0;
             return;
         }
-        return;                     /* ignore repeats */
+        return; /* ignore repeats */
     }
 
     if (dev->middle_down && !dev->middle_sent &&
@@ -157,34 +176,9 @@ static void process_internal(struct device *dev,
 
     emit_event(dev, ev);
 }
-static void process_external(struct device *dev,
-                             const struct input_event *ev)
-{
-    if (ev->type == EV_KEY && ev->code == BTN_MIDDLE)
-        return;                     /* drop middle‑click completely */
-    emit_event(dev, ev);
-}
 
 /* -----------------------------------------------------------------
- *  Clean‑up helper – destroy uinput nodes and release the grabs
- * ----------------------------------------------------------------- */
-static void cleanup(struct device *devices, size_t count)
-{
-    for (size_t i = 0; i < count; ++i) {
-        if (devices[i].ufd >= 0) {
-            ioctl(devices[i].ufd, UI_DEV_DESTROY);
-            close(devices[i].ufd);
-        }
-        if (devices[i].fd >= 0) {
-            ioctl(devices[i].fd, EVIOCGRAB, 0);
-            close(devices[i].fd);
-        }
-    }
-}
-
-/* -----------------------------------------------------------------
- *  Does the given /dev/input/eventX actually expose BTN_MIDDLE ?
- *  Returns 1 if the key is present, 0 otherwise.
+ *  Capability check: does /dev/input/eventX expose BTN_MIDDLE?
  * ----------------------------------------------------------------- */
 static int has_middle_button(const char *path)
 {
@@ -203,81 +197,217 @@ static int has_middle_button(const char *path)
 }
 
 /* -----------------------------------------------------------------
- *  libudev auto‑detect helper
- *
- *  Returns a NULL‑terminated malloc‑ed array of *device paths* that:
- *      • have ID_INPUT_POINTINGSTICK=1
- *      • really expose BTN_MIDDLE (checked above)
- *      • optionally match the user‑supplied regex against ID_MODEL
- *
- *  The caller must free each string and the array itself.
+ *  Read device name from the real device (best-effort)
  * ----------------------------------------------------------------- */
-static char **discover_trackpoints(const char *name_regex)
+static char *read_device_name(int fd)
 {
-    struct udev *udev = udev_new();
-    if (!udev) {
-        fprintf(stderr, "udev_new() failed\n");
-        return NULL;
+    char buf[256];
+    memset(buf, 0, sizeof(buf));
+    if (ioctl(fd, EVIOCGNAME(sizeof(buf)), buf) < 0 || buf[0] == '\0')
+        return strdup("TrackPoint");
+    return strdup(buf);
+}
+
+/* -----------------------------------------------------------------
+ *  Detect whether a udev "input" device is virtual (uinput)
+ *  We use syspath: uinput lives under /sys/devices/virtual/...
+ * ----------------------------------------------------------------- */
+static int is_virtual_input_udev_device(struct udev_device *d)
+{
+    const char *syspath = udev_device_get_syspath(d);
+    if (!syspath) return 0;
+    return (strstr(syspath, "/devices/virtual/") != NULL);
+}
+
+/* -----------------------------------------------------------------
+ *  "only if it has it" hex option matching
+ * ----------------------------------------------------------------- */
+static int hex_match_opt(const char *opt, const char *udev_val)
+{
+    if (!opt || !*opt) return 1;
+    if (!udev_val || !*udev_val) return 1; /* only filter if property exists */
+
+    while (!strncasecmp(opt, "0x", 2)) opt += 2;
+    return strcasecmp(opt, udev_val) == 0;
+}
+
+/* -----------------------------------------------------------------
+ *  Does a udev input device match our TrackPoint filters?
+ *  (and not be one of our own uinput devices)
+ * ----------------------------------------------------------------- */
+static int device_matches_filters(struct udev_device *d, const struct filters *f)
+{
+    /* Prevent infinite recursion: never match uinput/virtual devices */
+    if (is_virtual_input_udev_device(d))
+        return 0;
+
+    const char *tpflag = udev_device_get_property_value(d, "ID_INPUT_POINTINGSTICK");
+    if (!tpflag || strcmp(tpflag, "1") != 0) return 0;
+
+    const char *model = udev_device_get_property_value(d, "ID_MODEL");
+    const char *vid   = udev_device_get_property_value(d, "ID_VENDOR_ID");
+    const char *pid   = udev_device_get_property_value(d, "ID_MODEL_ID");
+
+    if (!hex_match_opt(f->vendor_id, vid)) return 0;
+    if (!hex_match_opt(f->product_id, pid)) return 0;
+
+    if (f->have_regex) {
+        if (!model) return 0;
+        if (regexec((regex_t *)&f->regex, model, 0, NULL, 0) != 0)
+            return 0;
     }
 
+    return 1;
+}
+
+/* -----------------------------------------------------------------
+ *  Find device by path
+ * ----------------------------------------------------------------- */
+static ssize_t find_device_idx(struct device *devices, size_t count, const char *path)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (devices[i].path && strcmp(devices[i].path, path) == 0)
+            return (ssize_t)i;
+    }
+    return -1;
+}
+
+/* -----------------------------------------------------------------
+ *  Remove device (close fds, destroy uinput, free strings, compact array)
+ * ----------------------------------------------------------------- */
+static void remove_device(struct device *devices, size_t *count, size_t idx)
+{
+    if (idx >= *count) return;
+
+    if (devices[idx].ufd >= 0) {
+        ioctl(devices[idx].ufd, UI_DEV_DESTROY);
+        close(devices[idx].ufd);
+    }
+    if (devices[idx].fd >= 0) {
+        ioctl(devices[idx].fd, EVIOCGRAB, 0);
+        close(devices[idx].fd);
+    }
+
+    free(devices[idx].path);
+    free(devices[idx].name);
+
+    if (idx != *count - 1)
+        devices[idx] = devices[*count - 1];
+
+    (*count)--;
+}
+
+/* -----------------------------------------------------------------
+ *  Add device by devnode path (grabs it and creates a uinput clone)
+ * ----------------------------------------------------------------- */
+static int add_device(struct device *devices, size_t *count, const char *path)
+{
+    if (*count >= MAX_DEVICES) {
+        fprintf(stderr, "Too many devices (max %d)\n", MAX_DEVICES);
+        return -1;
+    }
+
+    if (find_device_idx(devices, *count, path) >= 0)
+        return 0; /* already added */
+
+    struct device dev;
+    memset(&dev, 0, sizeof(dev));
+    dev.path = strdup(path);
+    dev.name = NULL;
+    dev.fd = -1;
+    dev.ufd = -1;
+
+    /* udev "add" can race /dev node creation; retry ENOENT a bit */
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        dev.fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (dev.fd >= 0) break;
+        if (errno == ENOENT) usleep(50000);
+        else break;
+    }
+    if (dev.fd < 0) {
+        perror(path);
+        free(dev.path);
+        return -1;
+    }
+
+    dev.name = read_device_name(dev.fd);
+
+    if (ioctl(dev.fd, EVIOCGRAB, 1) < 0) {
+        perror("EVIOCGRAB");
+        close(dev.fd);
+        free(dev.path);
+        free(dev.name);
+        return -1;
+    }
+
+    if (create_uinput(&dev) < 0) {
+        fprintf(stderr, "Failed to create uinput for %s\n", path);
+        ioctl(dev.fd, EVIOCGRAB, 0);
+        close(dev.fd);
+        free(dev.path);
+        free(dev.name);
+        return -1;
+    }
+
+    devices[*count] = dev;
+    (*count)++;
+
+    fprintf(stderr, "Filtering %s (%s) → uinput created\n",
+            path, dev.name ? dev.name : "?");
+    return 0;
+}
+
+/* -----------------------------------------------------------------
+ *  Cleanup all devices
+ * ----------------------------------------------------------------- */
+static void cleanup_all(struct device *devices, size_t *count)
+{
+    while (*count > 0)
+        remove_device(devices, count, *count - 1);
+}
+
+/* -----------------------------------------------------------------
+ *  Initial enumeration for --auto
+ * ----------------------------------------------------------------- */
+static void enumerate_existing_trackpoints(struct udev *udev,
+                                           const struct filters *f,
+                                           struct device *devices,
+                                           size_t *count)
+{
     struct udev_enumerate *e = udev_enumerate_new(udev);
-    if (!e) { udev_unref(udev); return NULL; }
+    if (!e) return;
 
     udev_enumerate_add_match_subsystem(e, "input");
     udev_enumerate_add_match_property(e, "ID_INPUT_POINTINGSTICK", "1");
     udev_enumerate_scan_devices(e);
 
-    regex_t regex;
-    int have_regex = (name_regex != NULL);
-    if (have_regex) {
-        int rc = regcomp(&regex, name_regex, REG_NOSUB | REG_ICASE);
-        if (rc != 0) {
-            char errbuf[128];
-            regerror(rc, &regex, errbuf, sizeof(errbuf));
-            fprintf(stderr, "Invalid regex \"%s\": %s\n", name_regex, errbuf);
-            udev_enumerate_unref(e);
-            udev_unref(udev);
-            return NULL;
-        }
-    }
-
-    char **list = calloc(MAX_DEVICES + 1, sizeof(char *));
-    if (!list) { perror("calloc"); if (have_regex) regfree(&regex);
-                  udev_enumerate_unref(e); udev_unref(udev); return NULL; }
-
-    size_t cnt = 0;
     struct udev_list_entry *entry;
     udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(e)) {
         const char *syspath = udev_list_entry_get_name(entry);
-        struct udev_device *dev = udev_device_new_from_syspath(udev, syspath);
-        const char *devnode = udev_device_get_devnode(dev);
-        const char *model   = udev_device_get_property_value(dev, "ID_MODEL");
+        struct udev_device *d = udev_device_new_from_syspath(udev, syspath);
+        if (!d) continue;
 
-        if (!devnode) { udev_device_unref(dev); continue; }
+        const char *devnode = udev_device_get_devnode(d);
+        if (!devnode || strncmp(devnode, "/dev/input/event", 16) != 0) {
+            udev_device_unref(d);
+            continue;
+        }
 
-        /* 1️⃣ the device must really have BTN_MIDDLE */
+        if (!device_matches_filters(d, f)) {
+            udev_device_unref(d);
+            continue;
+        }
+
         if (!has_middle_button(devnode)) {
-            udev_device_unref(dev);
+            udev_device_unref(d);
             continue;
         }
 
-        /* 2️⃣ optional name regex */
-        if (have_regex && model && regexec(&regex, model, 0, NULL, 0) != 0) {
-            udev_device_unref(dev);
-            continue;
-        }
-
-        if (cnt < MAX_DEVICES)
-            list[cnt++] = strdup(devnode);
-        udev_device_unref(dev);
+        add_device(devices, count, devnode);
+        udev_device_unref(d);
     }
 
-    list[cnt] = NULL;                     /* terminator */
-
-    if (have_regex) regfree(&regex);
     udev_enumerate_unref(e);
-    udev_unref(udev);
-    return list;
 }
 
 /* -----------------------------------------------------------------
@@ -290,21 +420,20 @@ static void usage(const char *progname)
         "\n"
         "Options:\n"
         "  -d, --device /dev/input/eventX   Add a specific device (repeatable).\n"
-        "  --auto                           Auto‑detect all TrackPoint devices.\n"
-        "  --match REGEX                    Optional extra filter on the device's\n"
-        "                                   ID_MODEL string (case‑insensitive POSIX regex).\n"
+        "  --auto                           Auto-detect TrackPoints and keep\n"
+        "                                   monitoring for hotplug add/remove.\n"
+        "  --match REGEX                    Optional filter on udev ID_MODEL\n"
+        "                                   (case-insensitive POSIX regex).\n"
+        "  --vendor HEX                     Optional filter on udev ID_VENDOR_ID\n"
+        "                                   (applies only if property exists).\n"
+        "  --product HEX                    Optional filter on udev ID_MODEL_ID\n"
+        "                                   (applies only if property exists).\n"
         "  -h, --help                       Show this help and exit.\n"
         "\n"
-        "How to find the correct eventX:\n"
-        "  $ udevadm info -a -n /dev/input/event13 | grep -i \"trackpoint\"\n"
-        "  $ libinput debug-events | grep -i \"trackpoint\"\n"
+        "Compile:\n"
+        "  gcc -Wall -O2 -D_GNU_SOURCE -o middle_button_disable middle-disable.c -ludev\n"
         "\n"
-        "Compile (needs libudev, POSIX regex is in libc):\n"
-        "  gcc -Wall -O2 -D_GNU_SOURCE -o middle_button_disable middle_button_disable.c -ludev\n"
-        "\n"
-        "Run as root (or with CAP_SYS_ADMIN).\n"
-        "\n"
-        "The source is 100 %% vibecode – feel free to tweak it!\n",
+        "Run as root (or with suitable privileges for /dev/uinput + EVIOCGRAB).\n",
         progname);
 }
 
@@ -313,19 +442,24 @@ static void usage(const char *progname)
  * ----------------------------------------------------------------- */
 int main(int argc, char *argv[])
 {
-    /* ----- command line parsing ----- */
     static const struct option long_opts[] = {
-        {"device", required_argument, NULL, 'd'},
-        {"auto",   no_argument,       NULL,  1 },
-        {"match",  required_argument, NULL,  2 },
-        {"help",   no_argument,       NULL, 'h'},
+        {"device",  required_argument, NULL, 'd'},
+        {"auto",    no_argument,       NULL,  1 },
+        {"match",   required_argument, NULL,  2 },
+        {"vendor",  required_argument, NULL,  3 },
+        {"product", required_argument, NULL,  4 },
+        {"help",    no_argument,       NULL, 'h'},
         {0,0,0,0}
     };
 
     const char *explicit_paths[MAX_DEVICES];
-    size_t      explicit_cnt = 0;
-    int         do_auto = 0;
+    size_t explicit_cnt = 0;
+
+    int do_auto = 0;
     const char *match_regex = NULL;
+
+    struct filters filt;
+    memset(&filt, 0, sizeof(filt));
 
     for (int c; (c = getopt_long(argc, argv, "d:h", long_opts, NULL)) != -1; ) {
         switch (c) {
@@ -336,11 +470,17 @@ int main(int argc, char *argv[])
             }
             explicit_paths[explicit_cnt++] = optarg;
             break;
-        case 1:   /* --auto */
+        case 1: /* --auto */
             do_auto = 1;
             break;
-        case 2:   /* --match */
+        case 2: /* --match */
             match_regex = optarg;
+            break;
+        case 3: /* --vendor */
+            filt.vendor_id = optarg;
+            break;
+        case 4: /* --product */
+            filt.product_id = optarg;
             break;
         case 'h':
         default:
@@ -349,157 +489,158 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* ----- build the final list of device paths ----- */
-    char **auto_list = NULL;
-    const char *paths[MAX_DEVICES];
-    size_t total_devices = 0;
-
-    if (do_auto) {
-        auto_list = discover_trackpoints(match_regex);
-        if (!auto_list) {
-            fprintf(stderr, "Auto‑detect failed.\n");
-            return EXIT_FAILURE;
-        }
-        for (size_t i = 0; auto_list[i] && total_devices < MAX_DEVICES; ++i)
-            paths[total_devices++] = auto_list[i];
-    }
-
-    for (size_t i = 0; i < explicit_cnt && total_devices < MAX_DEVICES; ++i)
-        paths[total_devices++] = explicit_paths[i];
-
-    if (total_devices == 0) {
+    if (!do_auto && explicit_cnt == 0) {
         fprintf(stderr, "No devices selected – use -d or --auto.\n");
         usage(argv[0]);
         return EXIT_FAILURE;
     }
 
-    /* ---------- install signal handlers ---------- */
+    if (match_regex) {
+        int rc = regcomp(&filt.regex, match_regex, REG_NOSUB | REG_ICASE);
+        if (rc != 0) {
+            char errbuf[128];
+            regerror(rc, &filt.regex, errbuf, sizeof(errbuf));
+            fprintf(stderr, "Invalid regex \"%s\": %s\n", match_regex, errbuf);
+            return EXIT_FAILURE;
+        }
+        filt.have_regex = 1;
+    }
+
     signal(SIGINT,  stop_handler);
     signal(SIGTERM, stop_handler);
 
-    /* ---------- open, grab, and create uinput for each device ---------- */
     struct device devices[MAX_DEVICES];
+    memset(devices, 0, sizeof(devices));
+    for (size_t i = 0; i < MAX_DEVICES; ++i) {
+        devices[i].fd = -1;
+        devices[i].ufd = -1;
+    }
+    size_t total_devices = 0;
 
-    for (size_t i = 0; i < total_devices; ++i) {
-        devices[i].path = paths[i];
-        devices[i].name = "TrackPoint (filtered)";
-        devices[i].fd   = -1;
-        devices[i].ufd  = -1;
-        devices[i].middle_down = 0;
-        devices[i].middle_sent = 0;
+    /* udev monitor (only if --auto) */
+    struct udev *udev = NULL;
+    struct udev_monitor *mon = NULL;
+    int mon_fd = -1;
 
-        devices[i].fd = open(devices[i].path, O_RDONLY | O_NONBLOCK);
-        if (devices[i].fd < 0) {
-            perror(devices[i].path);
-            cleanup(devices, i);
-            goto out_free;
+    if (do_auto) {
+        udev = udev_new();
+        if (!udev) {
+            fprintf(stderr, "udev_new() failed\n");
+            if (filt.have_regex) regfree(&filt.regex);
+            return EXIT_FAILURE;
         }
 
-        if (ioctl(devices[i].fd, EVIOCGRAB, 1) < 0) {
-            perror("EVIOCGRAB");
-            cleanup(devices, i + 1);
-            goto out_free;
+        mon = udev_monitor_new_from_netlink(udev, "udev");
+        if (!mon) {
+            fprintf(stderr, "udev_monitor_new_from_netlink() failed\n");
+            udev_unref(udev);
+            if (filt.have_regex) regfree(&filt.regex);
+            return EXIT_FAILURE;
         }
 
-        if (create_uinput(&devices[i]) < 0) {
-            fprintf(stderr, "Failed to create uinput for %s\n", devices[i].path);
-            cleanup(devices, i + 1);
-            goto out_free;
-        }
+        udev_monitor_filter_add_match_subsystem_devtype(mon, "input", NULL);
+        udev_monitor_enable_receiving(mon);
+        mon_fd = udev_monitor_get_fd(mon);
 
-        fprintf(stderr, "Filtering %s → uinput created\n", devices[i].path);
+        /* Add existing TrackPoints at startup */
+        enumerate_existing_trackpoints(udev, &filt, devices, &total_devices);
     }
 
-    /* ---------- main poll loop ---------- */
-    struct pollfd fds[MAX_DEVICES];
+    /* Add explicitly provided devices (no udev filtering here) */
+    for (size_t i = 0; i < explicit_cnt; ++i)
+        add_device(devices, &total_devices, explicit_paths[i]);
+
+    /* ---------------- main loop ---------------- */
+    struct pollfd fds[MAX_DEVICES + 1];
+
     while (running) {
-        for (size_t i = 0; i < total_devices; ++i) {
-            fds[i].fd      = devices[i].fd;
-            fds[i].events  = POLLIN;
-            fds[i].revents = 0;
+        nfds_t nfds = 0;
+
+        if (mon_fd >= 0) {
+            fds[nfds].fd = mon_fd;
+            fds[nfds].events = POLLIN;
+            fds[nfds].revents = 0;
+            nfds++;
         }
 
-        int ret = poll(fds, total_devices, -1);
+        for (size_t i = 0; i < total_devices; ++i) {
+            fds[nfds].fd = devices[i].fd;
+            fds[nfds].events = POLLIN;
+            fds[nfds].revents = 0;
+            nfds++;
+        }
+
+        int ret = poll(fds, nfds, -1);
         if (ret < 0) {
             if (errno == EINTR) continue;
             perror("poll");
             break;
         }
 
+        /* Handle udev hotplug */
+        if (mon_fd >= 0 && (fds[0].revents & POLLIN)) {
+            struct udev_device *ud;
+            while ((ud = udev_monitor_receive_device(mon)) != NULL) {
+                const char *action  = udev_device_get_action(ud);
+                const char *devnode = udev_device_get_devnode(ud);
+
+                if (action && devnode &&
+                    strncmp(devnode, "/dev/input/event", 16) == 0)
+                {
+                    if (strcmp(action, "add") == 0) {
+                        if (device_matches_filters(ud, &filt) &&
+                            has_middle_button(devnode))
+                        {
+                            add_device(devices, &total_devices, devnode);
+                        }
+                    } else if (strcmp(action, "remove") == 0) {
+                        ssize_t idx = find_device_idx(devices, total_devices, devnode);
+                        if (idx >= 0) {
+                            fprintf(stderr, "Device removed: %s\n", devnode);
+                            remove_device(devices, &total_devices, (size_t)idx);
+                        }
+                    }
+                }
+
+                udev_device_unref(ud);
+            }
+        }
+
+        /* Handle input events */
+        size_t base = (mon_fd >= 0) ? 1 : 0;
         for (size_t i = 0; i < total_devices; ++i) {
-            if (!(fds[i].revents & POLLIN)) continue;
+            if (!(fds[base + i].revents & POLLIN)) continue;
 
             struct input_event evbuf[32];
             ssize_t nbytes = read(devices[i].fd, evbuf, sizeof(evbuf));
             if (nbytes < 0) {
                 if (errno == EAGAIN || errno == EINTR) continue;
+
+                /* If the device disappears without us seeing a udev remove */
+                if (errno == ENODEV || errno == ENXIO || errno == EIO) {
+                    fprintf(stderr, "Device vanished: %s\n", devices[i].path);
+                    remove_device(devices, &total_devices, i);
+                    i--; /* array compacted; re-check this index */
+                    continue;
+                }
+
                 perror("read");
                 running = 0;
                 break;
             }
 
             size_t evcnt = (size_t)nbytes / sizeof(struct input_event);
-            for (size_t j = 0; j < evcnt; ++j) {
-                if (i == 0)
-                    process_internal(&devices[i], &evbuf[j]);
-                else
-                    process_external(&devices[i], &evbuf[j]);
-            }
+            for (size_t j = 0; j < evcnt; ++j)
+                process_trackpoint(&devices[i], &evbuf[j]);
         }
     }
 
-    cleanup(devices, total_devices);
+    cleanup_all(devices, &total_devices);
 
-out_free:
-    if (auto_list) {
-        for (size_t i = 0; auto_list[i]; ++i)
-            free((void *)auto_list[i]);
-        free(auto_list);
-    }
+    if (mon) udev_monitor_unref(mon);
+    if (udev) udev_unref(udev);
+
+    if (filt.have_regex) regfree(&filt.regex);
+
     return EXIT_SUCCESS;
 }
-
-/*=====================================================================
- *  README (excerpt) – how to use the program
- *=====================================================================
-
-# middle‑disable – Disable TrackPoint middle‑click, keep scrolling
-
-ThinkPad/Lenovo TrackPoint keyboards use the middle button together with the
-pointing stick to implement click‑and‑scroll.  When you also use the middle
-button to open hyperlinks this becomes painful.  This program removes the plain
-middle‑click while preserving the scrolling behaviour.
-
-## New command‑line interface
-
-| Option | Meaning |
-|--------|---------|
-| `-d /dev/input/eventX` (repeatable) | Explicitly add a single device. |
-| `--auto` | Auto‑detect all TrackPoint devices (the ones that expose `BTN_MIDDLE`). |
-| `--match "<regex>"` | Optional extra filter on the udev `ID_MODEL` property. Example: `--match "Lenovo"` keeps only Lenovo keyboards. |
-| `-h` / `--help` | Show this help. |
-
-### Why `--auto` used to list *too many* devices
-
-The original auto‑detect only looked at `ID_INPUT_POINTINGSTICK=1`.  Some USB
-hubs or touch‑screens also set that flag, so they were mistakenly added.
-
-The **new version** adds two safeguards:
-
-1. **Capability check** – the device must actually have the `BTN_MIDDLE` key
-   (checked via `EVIOCGBIT`).  
-2. **Optional name regex** – you can further narrow the list with `--match`.
-
-If you run `--auto` without a regex you’ll now see only the genuine
-TrackPoints (internal + external keyboards).  If you still get extras,
-add a regex that matches the model you want.
-
-## Finding your device name (`eventX`)
-
-```bash
-# Show the udev tree for a known node
-udevadm info -a -n /dev/input/event13 | grep -i "trackpoint"
-
-# Or use libinput’s live debug output
-libinput debug-events | grep -i "trackpoint"
-*/
