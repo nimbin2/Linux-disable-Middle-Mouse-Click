@@ -1,25 +1,28 @@
 /*=====================================================================
- *  middle-disable.c – disable TrackPoint middle-click, keep scrolling
+ *  middle_button_disable.c
  *
- *  (c) 2024 100 % vibecode – feel free to copy, hack and share
+ *  Disables the TrackPoint middle button (no BTN_MIDDLE ever reaches
+ *  userspace, so no primary-selection paste) while keeping middle-button
+ *  scrolling alive.
  *
- *  Build (needs libudev, POSIX regex is in libc):
- *      gcc -Wall -O2 -D_GNU_SOURCE -o middle_button_disable middle-disable.c -ludev
+ *  How:
+ *    - Grab the real TrackPoint device (EVIOCGRAB) and re-emit its events
+ *      through a uinput clone.
+ *    - BTN_MIDDLE is swallowed and only tracked internally.
+ *    - While the physical middle button is held, REL_X/REL_Y motion is
+ *      translated into wheel events instead of pointer motion.
  *
- *  CLI:
- *      -d /dev/input/eventX          (repeatable)
- *      --auto                       auto-detect TrackPoints (+ hotplug)
- *      --match <regex>              optional filter on ID_MODEL (case-insensitive POSIX regex)
- *      --vendor <hex>               optional filter on ID_VENDOR_ID (only if property exists)
- *      --product <hex>              optional filter on ID_MODEL_ID (only if property exists)
- *      -h / --help                  show help
+ *  Wheel events are emitted as high-resolution (REL_WHEEL_HI_RES,
+ *  120 units = one detent) *and* legacy (REL_WHEEL) events. libinput
+ *  ignores legacy events on devices that advertise hi-res axes, so
+ *  emitting only REL_WHEEL results in no scrolling at all.
  *
- *  Important fix:
- *    We MUST ignore the uinput devices we create ourselves, otherwise udev
- *    hotplug will see them as new pointingsticks and we recurse forever
- *    (event numbers skyrocketing like event256, event257, ...).
- *    We exclude /sys/devices/virtual/\* (uinput) devices and also give our
- *    uinput a distinctive name prefix.
+ *  Build:
+ *      gcc -Wall -Wextra -O2 -D_GNU_SOURCE \
+ *          -o middle_button_disable middle_button_disable.c -ludev
+ *
+ *  Run (needs access to /dev/input/event* and /dev/uinput):
+ *      sudo ./middle_button_disable --auto
  *====================================================================*/
 
 #ifndef _GNU_SOURCE
@@ -29,6 +32,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
 #include <poll.h>
@@ -42,11 +46,71 @@
 
 #include <libudev.h>
 
+/* Older headers may lack the hi-res wheel codes. */
+#ifndef REL_WHEEL_HI_RES
+#define REL_WHEEL_HI_RES 0x0b
+#endif
+#ifndef REL_HWHEEL_HI_RES
+#define REL_HWHEEL_HI_RES 0x0c
+#endif
+
 /* -----------------------------------------------------------------
- *  Constants & helper macros
+ *  Constants
  * ----------------------------------------------------------------- */
-#define MAX_DEVICES 32
-#define UINPUT_NAME_PREFIX "middle-disable: "
+#define MAX_DEVICES         32
+#define UINPUT_NAME_PREFIX  "middle-disable: "
+#define HI_RES_PER_DETENT   120     /* kernel ABI: 120 units == one click */
+#define DEFAULT_THRESHOLD   8       /* raw REL units per detent */
+
+/* -----------------------------------------------------------------
+ *  Runtime options
+ * ----------------------------------------------------------------- */
+struct options {
+    int threshold;      /* raw REL units per wheel detent (higher = slower) */
+    int natural;        /* invert scroll direction */
+    int hscroll;        /* horizontal scrolling enabled */
+};
+
+static struct options opts = {
+    .threshold = DEFAULT_THRESHOLD,
+    .natural   = 0,
+    .hscroll   = 1,
+};
+
+/* -----------------------------------------------------------------
+ *  Per-device state
+ * ----------------------------------------------------------------- */
+struct device {
+    char *path;                 /* /dev/input/eventX */
+    char *name;                 /* source device name */
+    int   fd;                   /* real device */
+    int   ufd;                  /* uinput clone */
+
+    int   middle_down;          /* physical BTN_MIDDLE is held */
+    int   native_wheel;         /* device emitted wheel itself while held */
+
+    /* Scroll accumulators. sub_* holds raw motion scaled by
+     * HI_RES_PER_DETENT; det_* holds hi-res units not yet converted
+     * into a legacy detent. */
+    long  sub_v, sub_h;
+    long  det_v, det_h;
+};
+
+/* -----------------------------------------------------------------
+ *  udev filters for --auto
+ * ----------------------------------------------------------------- */
+struct filters {
+    const char *vendor_id;      /* ID_VENDOR_ID, checked only if present */
+    const char *product_id;     /* ID_MODEL_ID,  checked only if present */
+    int         have_regex;
+    regex_t     regex;          /* matched against ID_MODEL */
+};
+
+/* -----------------------------------------------------------------
+ *  Signals
+ * ----------------------------------------------------------------- */
+static volatile sig_atomic_t running = 1;
+static void stop_handler(int sig) { (void)sig; running = 0; }
 
 static inline int test_bit(unsigned int nr, const unsigned long *addr)
 {
@@ -55,69 +119,148 @@ static inline int test_bit(unsigned int nr, const unsigned long *addr)
 }
 
 /* -----------------------------------------------------------------
- *  Device description
+ *  uinput output
  * ----------------------------------------------------------------- */
-struct device {
-    char *path;                 /* strdup()ed, e.g. /dev/input/eventX */
-    char *name;                 /* strdup()ed source device name (for logs) */
-    int  fd;                    /* fd of the real grabbed device */
-    int  ufd;                   /* fd of the uinput virtual device */
-    int  middle_down;           /* BTN_MIDDLE currently pressed */
-    int  middle_sent;           /* we already emitted a synthetic press */
-};
-
-/* -----------------------------------------------------------------
- *  Filters (applied to --auto and hotplug)
- * ----------------------------------------------------------------- */
-struct filters {
-    const char *vendor_id;      /* hex, e.g. "17ef" (only if udev property exists) */
-    const char *product_id;     /* hex, e.g. "60ee" (only if udev property exists) */
-    int have_regex;
-    regex_t regex;
-};
-
-/* -----------------------------------------------------------------
- *  Global stop flag (SIGINT / SIGTERM)
- * ----------------------------------------------------------------- */
-static volatile sig_atomic_t running = 1;
-static void stop_handler(int sig) { (void)sig; running = 0; }
-
-/* -----------------------------------------------------------------
- *  uinput emit helpers
- * ----------------------------------------------------------------- */
-static int emit_event(struct device *dev, const struct input_event *ev)
+static void emit_event(struct device *dev, const struct input_event *ev)
 {
     ssize_t n = write(dev->ufd, ev, sizeof(*ev));
-    return (n == sizeof(*ev)) ? 0 : -1;
+    (void)n;    /* uinput writes are all-or-nothing; nothing to retry */
 }
 
-static int emit_key(struct device *dev, const struct input_event *src,
-                    int code, int value)
+static void emit_rel(struct device *dev, const struct input_event *src,
+                     int code, int value)
 {
     struct input_event ev = *src;
-    ev.type  = EV_KEY;
+    ev.type  = EV_REL;
     ev.code  = code;
     ev.value = value;
-    return emit_event(dev, &ev);
+    emit_event(dev, &ev);
 }
 
 /* -----------------------------------------------------------------
- *  Create uinput device
+ *  Scroll conversion
+ *
+ *  raw   : motion delta on this axis, sign already normalised so that
+ *          positive == wheel up / wheel right
+ *  sub   : leftover raw motion, scaled by HI_RES_PER_DETENT
+ *  det   : leftover hi-res units toward the next legacy detent
+ * ----------------------------------------------------------------- */
+static void scroll_axis(struct device *dev, const struct input_event *src,
+                        int raw, long *sub, long *det,
+                        int code_hi, int code_lo)
+{
+    *sub += (long)raw * HI_RES_PER_DETENT;
+
+    long hi = *sub / opts.threshold;    /* truncates toward zero: symmetric */
+    if (hi == 0)
+        return;
+    *sub -= hi * opts.threshold;
+
+    emit_rel(dev, src, code_hi, (int)hi);
+
+    *det += hi;
+    long steps = *det / HI_RES_PER_DETENT;
+    if (steps != 0) {
+        *det -= steps * HI_RES_PER_DETENT;
+        emit_rel(dev, src, code_lo, (int)steps);
+    }
+}
+
+static void reset_scroll(struct device *dev)
+{
+    dev->sub_v = dev->sub_h = 0;
+    dev->det_v = dev->det_h = 0;
+    dev->native_wheel = 0;
+}
+
+/* -----------------------------------------------------------------
+ *  Core event filter
+ * ----------------------------------------------------------------- */
+static void process_event(struct device *dev, const struct input_event *ev)
+{
+    /* Middle button: never forwarded, only tracked. */
+    if (ev->type == EV_KEY && ev->code == BTN_MIDDLE) {
+        if (ev->value == 1) {
+            dev->middle_down = 1;
+            reset_scroll(dev);
+        } else if (ev->value == 0) {
+            dev->middle_down = 0;
+            reset_scroll(dev);
+        }
+        return;
+    }
+
+    if (!dev->middle_down) {
+        emit_event(dev, ev);
+        return;
+    }
+
+    /* ---- middle button held: scroll mode ---- */
+
+    if (ev->type == EV_REL) {
+        switch (ev->code) {
+        case REL_WHEEL:
+        case REL_HWHEEL:
+        case REL_WHEEL_HI_RES:
+        case REL_HWHEEL_HI_RES:
+            /* Device scrolls on its own; don't emulate on top of it. */
+            dev->native_wheel = 1;
+            emit_event(dev, ev);
+            return;
+
+        case REL_Y:
+            if (dev->native_wheel)
+                return;
+            /* REL_Y is positive downward, wheel up is positive. */
+            scroll_axis(dev, ev,
+                        opts.natural ? ev->value : -ev->value,
+                        &dev->sub_v, &dev->det_v,
+                        REL_WHEEL_HI_RES, REL_WHEEL);
+            return;
+
+        case REL_X:
+            if (dev->native_wheel || !opts.hscroll)
+                return;
+            scroll_axis(dev, ev,
+                        opts.natural ? -ev->value : ev->value,
+                        &dev->sub_h, &dev->det_h,
+                        REL_HWHEEL_HI_RES, REL_HWHEEL);
+            return;
+
+        default:
+            return;     /* swallow other motion while scrolling */
+        }
+    }
+
+    /* Buttons, SYN, everything else passes through unchanged. */
+    emit_event(dev, ev);
+}
+
+/* -----------------------------------------------------------------
+ *  uinput clone creation
  * ----------------------------------------------------------------- */
 static int create_uinput(struct device *dev)
 {
-    dev->ufd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-    if (dev->ufd < 0) { perror("/dev/uinput"); return -1; }
+    struct input_id id;
+    struct uinput_setup setup;
+
+    dev->ufd = open("/dev/uinput", O_WRONLY);
+    if (dev->ufd < 0) {
+        perror("/dev/uinput");
+        return -1;
+    }
 
     if (ioctl(dev->ufd, UI_SET_EVBIT, EV_KEY) < 0 ||
         ioctl(dev->ufd, UI_SET_EVBIT, EV_REL) < 0 ||
         ioctl(dev->ufd, UI_SET_EVBIT, EV_SYN) < 0)
-        return -1;
+        goto fail;
 
     if (ioctl(dev->ufd, UI_SET_KEYBIT, BTN_LEFT)   < 0 ||
-        ioctl(dev->ufd, UI_SET_KEYBIT, BTN_RIGHT)  < 0 ||
-        ioctl(dev->ufd, UI_SET_KEYBIT, BTN_MIDDLE) < 0)
-        return -1;
+        ioctl(dev->ufd, UI_SET_KEYBIT, BTN_RIGHT)  < 0)
+        goto fail;
+
+    /* BTN_MIDDLE is deliberately NOT declared: the clone has no middle
+     * button at all, so nothing downstream can synthesise a paste. */
 
     if (ioctl(dev->ufd, UI_SET_RELBIT, REL_X)             < 0 ||
         ioctl(dev->ufd, UI_SET_RELBIT, REL_Y)             < 0 ||
@@ -125,204 +268,145 @@ static int create_uinput(struct device *dev)
         ioctl(dev->ufd, UI_SET_RELBIT, REL_HWHEEL)        < 0 ||
         ioctl(dev->ufd, UI_SET_RELBIT, REL_WHEEL_HI_RES)  < 0 ||
         ioctl(dev->ufd, UI_SET_RELBIT, REL_HWHEEL_HI_RES) < 0)
-        return -1;
+        goto fail;
 
-    /* Mark as virtual so we can reliably exclude it from --auto/hotplug */
-    struct uinput_setup setup = {
-        .id = {
-            .bustype = BUS_VIRTUAL,
-            .vendor  = 0xfeed,
-            .product = 0x0001,
-            .version = 1
-        }
-    };
+    /* Advertise as a pointing stick so libinput applies TrackPoint
+     * acceleration instead of generic mouse acceleration. */
+#ifdef INPUT_PROP_POINTING_STICK
+    ioctl(dev->ufd, UI_SET_PROPBIT, INPUT_PROP_POINTING_STICK);
+#endif
+#ifdef INPUT_PROP_POINTER
+    ioctl(dev->ufd, UI_SET_PROPBIT, INPUT_PROP_POINTER);
+#endif
 
-    const char *srcname = dev->name ? dev->name : "TrackPoint";
-    snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "%s%s", UINPUT_NAME_PREFIX, srcname);
+    memset(&setup, 0, sizeof(setup));
+    memset(&id, 0, sizeof(id));
 
-    if (ioctl(dev->ufd, UI_DEV_SETUP, &setup) < 0) return -1;
-    if (ioctl(dev->ufd, UI_DEV_CREATE, 0)    < 0) return -1;
+    /* Inherit vendor/product from the source, but stay on BUS_VIRTUAL so
+     * the clone lands under /sys/devices/virtual/ and our own hotplug
+     * filter can exclude it. */
+    if (ioctl(dev->fd, EVIOCGID, &id) == 0) {
+        setup.id.vendor  = id.vendor;
+        setup.id.product = id.product;
+        setup.id.version = id.version;
+    } else {
+        setup.id.vendor  = 0xfeed;
+        setup.id.product = 0x0001;
+        setup.id.version = 1;
+    }
+    setup.id.bustype = BUS_VIRTUAL;
 
-    usleep(100000);
+    snprintf(setup.name, UINPUT_MAX_NAME_SIZE, "%s%s",
+             UINPUT_NAME_PREFIX, dev->name ? dev->name : "TrackPoint");
+
+    if (ioctl(dev->ufd, UI_DEV_SETUP, &setup) < 0) goto fail;
+    if (ioctl(dev->ufd, UI_DEV_CREATE, 0)     < 0) goto fail;
+
+    usleep(100000);     /* let udev settle before events start flowing */
     return 0;
+
+fail:
+    perror("uinput setup");
+    close(dev->ufd);
+    dev->ufd = -1;
+    return -1;
 }
 
 /* -----------------------------------------------------------------
- *  Event processing: Disable plain middle-click, keep scroll behavior
- * ----------------------------------------------------------------- */
-static void process_trackpoint(struct device *dev, const struct input_event *ev)
-{
-    if (ev->type == EV_KEY && ev->code == BTN_MIDDLE) {
-        if (ev->value == 1) { dev->middle_down = 1; return; }
-        if (ev->value == 0) {
-            if (dev->middle_sent) emit_key(dev, ev, BTN_MIDDLE, 0);
-            dev->middle_down = 0;
-            dev->middle_sent = 0;
-            return;
-        }
-        return; /* ignore repeats */
-    }
-
-    if (dev->middle_down && !dev->middle_sent &&
-        ev->type == EV_REL &&
-        (ev->code == REL_WHEEL ||
-         ev->code == REL_HWHEEL ||
-         ev->code == REL_WHEEL_HI_RES ||
-         ev->code == REL_HWHEEL_HI_RES))
-    {
-        emit_key(dev, ev, BTN_MIDDLE, 1);
-        dev->middle_sent = 1;
-    }
-
-    emit_event(dev, ev);
-}
-
-/* -----------------------------------------------------------------
- *  Capability check: does /dev/input/eventX expose BTN_MIDDLE?
+ *  Device helpers
  * ----------------------------------------------------------------- */
 static int has_middle_button(const char *path)
 {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return 0;
-
     unsigned long bits[(KEY_MAX / (8 * sizeof(unsigned long))) + 1];
-    memset(bits, 0, sizeof(bits));
+    int fd = open(path, O_RDONLY);
+    int ok;
 
-    if (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(bits)), bits) < 0) {
-        close(fd);
+    if (fd < 0)
         return 0;
-    }
+
+    memset(bits, 0, sizeof(bits));
+    ok = (ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(bits)), bits) >= 0) &&
+         test_bit(BTN_MIDDLE, bits);
     close(fd);
-    return test_bit(BTN_MIDDLE, bits);
+    return ok;
 }
 
-/* -----------------------------------------------------------------
- *  Read device name from the real device (best-effort)
- * ----------------------------------------------------------------- */
 static char *read_device_name(int fd)
 {
     char buf[256];
+
     memset(buf, 0, sizeof(buf));
     if (ioctl(fd, EVIOCGNAME(sizeof(buf)), buf) < 0 || buf[0] == '\0')
         return strdup("TrackPoint");
     return strdup(buf);
 }
 
-/* -----------------------------------------------------------------
- *  Detect whether a udev "input" device is virtual (uinput)
- *  We use syspath: uinput lives under /sys/devices/virtual/...
- * ----------------------------------------------------------------- */
-static int is_virtual_input_udev_device(struct udev_device *d)
+static ssize_t find_device_idx(struct device *devs, size_t count, const char *path)
 {
-    const char *syspath = udev_device_get_syspath(d);
-    if (!syspath) return 0;
-    return (strstr(syspath, "/devices/virtual/") != NULL);
-}
-
-/* -----------------------------------------------------------------
- *  "only if it has it" hex option matching
- * ----------------------------------------------------------------- */
-static int hex_match_opt(const char *opt, const char *udev_val)
-{
-    if (!opt || !*opt) return 1;
-    if (!udev_val || !*udev_val) return 1; /* only filter if property exists */
-
-    while (!strncasecmp(opt, "0x", 2)) opt += 2;
-    return strcasecmp(opt, udev_val) == 0;
-}
-
-/* -----------------------------------------------------------------
- *  Does a udev input device match our TrackPoint filters?
- *  (and not be one of our own uinput devices)
- * ----------------------------------------------------------------- */
-static int device_matches_filters(struct udev_device *d, const struct filters *f)
-{
-    /* Prevent infinite recursion: never match uinput/virtual devices */
-    if (is_virtual_input_udev_device(d))
-        return 0;
-
-    const char *tpflag = udev_device_get_property_value(d, "ID_INPUT_POINTINGSTICK");
-    if (!tpflag || strcmp(tpflag, "1") != 0) return 0;
-
-    const char *model = udev_device_get_property_value(d, "ID_MODEL");
-    const char *vid   = udev_device_get_property_value(d, "ID_VENDOR_ID");
-    const char *pid   = udev_device_get_property_value(d, "ID_MODEL_ID");
-
-    if (!hex_match_opt(f->vendor_id, vid)) return 0;
-    if (!hex_match_opt(f->product_id, pid)) return 0;
-
-    if (f->have_regex) {
-        if (!model) return 0;
-        if (regexec((regex_t *)&f->regex, model, 0, NULL, 0) != 0)
-            return 0;
-    }
-
-    return 1;
-}
-
-/* -----------------------------------------------------------------
- *  Find device by path
- * ----------------------------------------------------------------- */
-static ssize_t find_device_idx(struct device *devices, size_t count, const char *path)
-{
-    for (size_t i = 0; i < count; ++i) {
-        if (devices[i].path && strcmp(devices[i].path, path) == 0)
+    for (size_t i = 0; i < count; ++i)
+        if (devs[i].path && strcmp(devs[i].path, path) == 0)
             return (ssize_t)i;
-    }
     return -1;
 }
 
-/* -----------------------------------------------------------------
- *  Remove device (close fds, destroy uinput, free strings, compact array)
- * ----------------------------------------------------------------- */
-static void remove_device(struct device *devices, size_t *count, size_t idx)
+static void remove_device(struct device *devs, size_t *count, size_t idx)
 {
-    if (idx >= *count) return;
+    if (idx >= *count)
+        return;
 
-    if (devices[idx].ufd >= 0) {
-        ioctl(devices[idx].ufd, UI_DEV_DESTROY);
-        close(devices[idx].ufd);
+    if (devs[idx].ufd >= 0) {
+        ioctl(devs[idx].ufd, UI_DEV_DESTROY);
+        close(devs[idx].ufd);
     }
-    if (devices[idx].fd >= 0) {
-        ioctl(devices[idx].fd, EVIOCGRAB, 0);
-        close(devices[idx].fd);
+    if (devs[idx].fd >= 0) {
+        ioctl(devs[idx].fd, EVIOCGRAB, 0);
+        close(devs[idx].fd);
     }
 
-    free(devices[idx].path);
-    free(devices[idx].name);
+    free(devs[idx].path);
+    free(devs[idx].name);
 
     if (idx != *count - 1)
-        devices[idx] = devices[*count - 1];
+        devs[idx] = devs[*count - 1];
+    memset(&devs[*count - 1], 0, sizeof(struct device));
+    devs[*count - 1].fd = -1;
+    devs[*count - 1].ufd = -1;
 
     (*count)--;
 }
 
-/* -----------------------------------------------------------------
- *  Add device by devnode path (grabs it and creates a uinput clone)
- * ----------------------------------------------------------------- */
-static int add_device(struct device *devices, size_t *count, const char *path)
+static void cleanup_all(struct device *devs, size_t *count)
 {
+    while (*count > 0)
+        remove_device(devs, count, *count - 1);
+}
+
+static int add_device(struct device *devs, size_t *count, const char *path)
+{
+    struct device dev;
+
     if (*count >= MAX_DEVICES) {
         fprintf(stderr, "Too many devices (max %d)\n", MAX_DEVICES);
         return -1;
     }
+    if (find_device_idx(devs, *count, path) >= 0)
+        return 0;
 
-    if (find_device_idx(devices, *count, path) >= 0)
-        return 0; /* already added */
-
-    struct device dev;
     memset(&dev, 0, sizeof(dev));
-    dev.path = strdup(path);
-    dev.name = NULL;
-    dev.fd = -1;
+    dev.fd  = -1;
     dev.ufd = -1;
+    dev.path = strdup(path);
+    if (!dev.path)
+        return -1;
 
-    /* udev "add" can race /dev node creation; retry ENOENT a bit */
+    /* Hotplugged nodes can appear slightly before they are openable. */
     for (int attempt = 0; attempt < 20; ++attempt) {
-        dev.fd = open(path, O_RDONLY | O_NONBLOCK);
-        if (dev.fd >= 0) break;
-        if (errno == ENOENT) usleep(50000);
-        else break;
+        dev.fd = open(path, O_RDONLY);
+        if (dev.fd >= 0)
+            break;
+        if (errno != ENOENT && errno != EACCES)
+            break;
+        usleep(50000);
     }
     if (dev.fd < 0) {
         perror(path);
@@ -334,76 +418,102 @@ static int add_device(struct device *devices, size_t *count, const char *path)
 
     if (ioctl(dev.fd, EVIOCGRAB, 1) < 0) {
         perror("EVIOCGRAB");
-        close(dev.fd);
-        free(dev.path);
-        free(dev.name);
-        return -1;
+        goto fail;
     }
 
     if (create_uinput(&dev) < 0) {
-        fprintf(stderr, "Failed to create uinput for %s\n", path);
+        fprintf(stderr, "Failed to create uinput clone for %s\n", path);
         ioctl(dev.fd, EVIOCGRAB, 0);
-        close(dev.fd);
-        free(dev.path);
-        free(dev.name);
-        return -1;
+        goto fail;
     }
 
-    devices[*count] = dev;
+    devs[*count] = dev;
     (*count)++;
 
-    fprintf(stderr, "Filtering %s (%s) → uinput created\n",
-            path, dev.name ? dev.name : "?");
+    fprintf(stderr, "Filtering %s (%s)\n", path, dev.name);
     return 0;
+
+fail:
+    close(dev.fd);
+    free(dev.path);
+    free(dev.name);
+    return -1;
 }
 
 /* -----------------------------------------------------------------
- *  Cleanup all devices
+ *  udev matching
  * ----------------------------------------------------------------- */
-static void cleanup_all(struct device *devices, size_t *count)
+static int is_virtual(struct udev_device *d)
 {
-    while (*count > 0)
-        remove_device(devices, count, *count - 1);
+    const char *syspath = udev_device_get_syspath(d);
+    return syspath && strstr(syspath, "/devices/virtual/") != NULL;
 }
 
-/* -----------------------------------------------------------------
- *  Initial enumeration for --auto
- * ----------------------------------------------------------------- */
-static void enumerate_existing_trackpoints(struct udev *udev,
-                                           const struct filters *f,
-                                           struct device *devices,
-                                           size_t *count)
+static int hex_match_opt(const char *opt, const char *udev_val)
+{
+    if (!opt || !*opt)          return 1;
+    if (!udev_val || !*udev_val) return 1;
+
+    while (!strncasecmp(opt, "0x", 2))
+        opt += 2;
+    return strcasecmp(opt, udev_val) == 0;
+}
+
+static int device_matches(struct udev_device *d, const struct filters *f)
+{
+    const char *flag, *model, *vid, *pid;
+
+    if (is_virtual(d))
+        return 0;
+
+    flag = udev_device_get_property_value(d, "ID_INPUT_POINTINGSTICK");
+    if (!flag || strcmp(flag, "1") != 0)
+        return 0;
+
+    model = udev_device_get_property_value(d, "ID_MODEL");
+    vid   = udev_device_get_property_value(d, "ID_VENDOR_ID");
+    pid   = udev_device_get_property_value(d, "ID_MODEL_ID");
+
+    if (!hex_match_opt(f->vendor_id, vid))  return 0;
+    if (!hex_match_opt(f->product_id, pid)) return 0;
+
+    if (f->have_regex) {
+        if (!model)
+            return 0;
+        if (regexec((regex_t *)&f->regex, model, 0, NULL, 0) != 0)
+            return 0;
+    }
+    return 1;
+}
+
+static void enumerate_trackpoints(struct udev *udev, const struct filters *f,
+                                  struct device *devs, size_t *count)
 {
     struct udev_enumerate *e = udev_enumerate_new(udev);
-    if (!e) return;
+    struct udev_list_entry *entry;
+
+    if (!e)
+        return;
 
     udev_enumerate_add_match_subsystem(e, "input");
     udev_enumerate_add_match_property(e, "ID_INPUT_POINTINGSTICK", "1");
     udev_enumerate_scan_devices(e);
 
-    struct udev_list_entry *entry;
     udev_list_entry_foreach(entry, udev_enumerate_get_list_entry(e)) {
-        const char *syspath = udev_list_entry_get_name(entry);
-        struct udev_device *d = udev_device_new_from_syspath(udev, syspath);
-        if (!d) continue;
+        struct udev_device *d =
+            udev_device_new_from_syspath(udev, udev_list_entry_get_name(entry));
+        const char *devnode;
 
-        const char *devnode = udev_device_get_devnode(d);
-        if (!devnode || strncmp(devnode, "/dev/input/event", 16) != 0) {
-            udev_device_unref(d);
+        if (!d)
             continue;
-        }
 
-        if (!device_matches_filters(d, f)) {
-            udev_device_unref(d);
-            continue;
-        }
+        devnode = udev_device_get_devnode(d);
+        if (devnode &&
+            strncmp(devnode, "/dev/input/event", 16) == 0 &&
+            device_matches(d, f) &&
+            has_middle_button(devnode))
+            add_device(devs, count, devnode);
 
-        if (!has_middle_button(devnode)) {
-            udev_device_unref(d);
-            continue;
-        }
-
-        add_device(devices, count, devnode);
         udev_device_unref(d);
     }
 
@@ -411,57 +521,67 @@ static void enumerate_existing_trackpoints(struct udev *udev,
 }
 
 /* -----------------------------------------------------------------
- *  Usage / help text
+ *  CLI
  * ----------------------------------------------------------------- */
-static void usage(const char *progname)
+static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s [options]\n"
         "\n"
-        "Options:\n"
-        "  -d, --device /dev/input/eventX   Add a specific device (repeatable).\n"
-        "  --auto                           Auto-detect TrackPoints and keep\n"
-        "                                   monitoring for hotplug add/remove.\n"
-        "  --match REGEX                    Optional filter on udev ID_MODEL\n"
-        "                                   (case-insensitive POSIX regex).\n"
-        "  --vendor HEX                     Optional filter on udev ID_VENDOR_ID\n"
-        "                                   (applies only if property exists).\n"
-        "  --product HEX                    Optional filter on udev ID_MODEL_ID\n"
-        "                                   (applies only if property exists).\n"
-        "  -h, --help                       Show this help and exit.\n"
+        "Device selection:\n"
+        "  -d, --device PATH    Filter a specific /dev/input/eventX (repeatable).\n"
+        "      --auto           Auto-detect TrackPoints and follow hotplug.\n"
+        "      --match REGEX    Restrict --auto by udev ID_MODEL (case-insensitive).\n"
+        "      --vendor HEX     Restrict --auto by udev ID_VENDOR_ID.\n"
+        "      --product HEX    Restrict --auto by udev ID_MODEL_ID.\n"
         "\n"
-        "Compile:\n"
-        "  gcc -Wall -O2 -D_GNU_SOURCE -o middle_button_disable middle-disable.c -ludev\n"
+        "Scrolling:\n"
+        "  -t, --threshold N    Motion units per wheel detent (default %d,\n"
+        "                       higher = slower scrolling).\n"
+        "  -n, --natural        Invert scroll direction.\n"
+        "      --no-hscroll     Disable horizontal scrolling.\n"
         "\n"
-        "Run as root (or with suitable privileges for /dev/uinput + EVIOCGRAB).\n",
-        progname);
+        "  -h, --help           Show this help.\n"
+        "\n"
+        "Build:\n"
+        "  gcc -Wall -Wextra -O2 -D_GNU_SOURCE -o %s %s.c -ludev\n",
+        prog, DEFAULT_THRESHOLD, prog, prog);
 }
 
-/* -----------------------------------------------------------------
- *  main()
- * ----------------------------------------------------------------- */
 int main(int argc, char *argv[])
 {
     static const struct option long_opts[] = {
-        {"device",  required_argument, NULL, 'd'},
-        {"auto",    no_argument,       NULL,  1 },
-        {"match",   required_argument, NULL,  2 },
-        {"vendor",  required_argument, NULL,  3 },
-        {"product", required_argument, NULL,  4 },
-        {"help",    no_argument,       NULL, 'h'},
-        {0,0,0,0}
+        {"device",     required_argument, NULL, 'd'},
+        {"threshold",  required_argument, NULL, 't'},
+        {"natural",    no_argument,       NULL, 'n'},
+        {"auto",       no_argument,       NULL,  1 },
+        {"match",      required_argument, NULL,  2 },
+        {"vendor",     required_argument, NULL,  3 },
+        {"product",    required_argument, NULL,  4 },
+        {"no-hscroll", no_argument,       NULL,  5 },
+        {"help",       no_argument,       NULL, 'h'},
+        {0, 0, 0, 0}
     };
 
     const char *explicit_paths[MAX_DEVICES];
     size_t explicit_cnt = 0;
-
-    int do_auto = 0;
     const char *match_regex = NULL;
+    int do_auto = 0;
 
     struct filters filt;
+    struct device devs[MAX_DEVICES];
+    size_t total = 0;
+
+    struct udev *udev = NULL;
+    struct udev_monitor *mon = NULL;
+    int mon_fd = -1;
+
+    struct pollfd fds[MAX_DEVICES + 1];
+    size_t devidx[MAX_DEVICES + 1];
+
     memset(&filt, 0, sizeof(filt));
 
-    for (int c; (c = getopt_long(argc, argv, "d:h", long_opts, NULL)) != -1; ) {
+    for (int c; (c = getopt_long(argc, argv, "d:t:nh", long_opts, NULL)) != -1; ) {
         switch (c) {
         case 'd':
             if (explicit_cnt >= MAX_DEVICES) {
@@ -470,18 +590,21 @@ int main(int argc, char *argv[])
             }
             explicit_paths[explicit_cnt++] = optarg;
             break;
-        case 1: /* --auto */
-            do_auto = 1;
+        case 't': {
+            int v = atoi(optarg);
+            if (v < 1 || v > 1000) {
+                fprintf(stderr, "--threshold must be between 1 and 1000\n");
+                return EXIT_FAILURE;
+            }
+            opts.threshold = v;
             break;
-        case 2: /* --match */
-            match_regex = optarg;
-            break;
-        case 3: /* --vendor */
-            filt.vendor_id = optarg;
-            break;
-        case 4: /* --product */
-            filt.product_id = optarg;
-            break;
+        }
+        case 'n': opts.natural = 1;      break;
+        case  1:  do_auto = 1;           break;
+        case  2:  match_regex = optarg;  break;
+        case  3:  filt.vendor_id = optarg;  break;
+        case  4:  filt.product_id = optarg; break;
+        case  5:  opts.hscroll = 0;      break;
         case 'h':
         default:
             usage(argv[0]);
@@ -490,7 +613,7 @@ int main(int argc, char *argv[])
     }
 
     if (!do_auto && explicit_cnt == 0) {
-        fprintf(stderr, "No devices selected – use -d or --auto.\n");
+        fprintf(stderr, "No devices selected - use -d or --auto.\n\n");
         usage(argv[0]);
         return EXIT_FAILURE;
     }
@@ -498,9 +621,9 @@ int main(int argc, char *argv[])
     if (match_regex) {
         int rc = regcomp(&filt.regex, match_regex, REG_NOSUB | REG_ICASE);
         if (rc != 0) {
-            char errbuf[128];
-            regerror(rc, &filt.regex, errbuf, sizeof(errbuf));
-            fprintf(stderr, "Invalid regex \"%s\": %s\n", match_regex, errbuf);
+            char err[128];
+            regerror(rc, &filt.regex, err, sizeof(err));
+            fprintf(stderr, "Invalid regex \"%s\": %s\n", match_regex, err);
             return EXIT_FAILURE;
         }
         filt.have_regex = 1;
@@ -509,75 +632,67 @@ int main(int argc, char *argv[])
     signal(SIGINT,  stop_handler);
     signal(SIGTERM, stop_handler);
 
-    struct device devices[MAX_DEVICES];
-    memset(devices, 0, sizeof(devices));
+    memset(devs, 0, sizeof(devs));
     for (size_t i = 0; i < MAX_DEVICES; ++i) {
-        devices[i].fd = -1;
-        devices[i].ufd = -1;
+        devs[i].fd  = -1;
+        devs[i].ufd = -1;
     }
-    size_t total_devices = 0;
-
-    /* udev monitor (only if --auto) */
-    struct udev *udev = NULL;
-    struct udev_monitor *mon = NULL;
-    int mon_fd = -1;
 
     if (do_auto) {
         udev = udev_new();
         if (!udev) {
             fprintf(stderr, "udev_new() failed\n");
-            if (filt.have_regex) regfree(&filt.regex);
-            return EXIT_FAILURE;
+            goto done;
         }
 
         mon = udev_monitor_new_from_netlink(udev, "udev");
         if (!mon) {
             fprintf(stderr, "udev_monitor_new_from_netlink() failed\n");
-            udev_unref(udev);
-            if (filt.have_regex) regfree(&filt.regex);
-            return EXIT_FAILURE;
+            goto done;
         }
 
         udev_monitor_filter_add_match_subsystem_devtype(mon, "input", NULL);
         udev_monitor_enable_receiving(mon);
         mon_fd = udev_monitor_get_fd(mon);
 
-        /* Add existing TrackPoints at startup */
-        enumerate_existing_trackpoints(udev, &filt, devices, &total_devices);
+        enumerate_trackpoints(udev, &filt, devs, &total);
     }
 
-    /* Add explicitly provided devices (no udev filtering here) */
     for (size_t i = 0; i < explicit_cnt; ++i)
-        add_device(devices, &total_devices, explicit_paths[i]);
+        add_device(devs, &total, explicit_paths[i]);
 
-    /* ---------------- main loop ---------------- */
-    struct pollfd fds[MAX_DEVICES + 1];
+    if (total == 0)
+        fprintf(stderr, "Warning: no matching device found yet.\n");
 
     while (running) {
         nfds_t nfds = 0;
+        size_t base;
+        int dead[MAX_DEVICES];
 
         if (mon_fd >= 0) {
-            fds[nfds].fd = mon_fd;
-            fds[nfds].events = POLLIN;
+            fds[nfds].fd      = mon_fd;
+            fds[nfds].events  = POLLIN;
             fds[nfds].revents = 0;
             nfds++;
         }
+        base = nfds;
 
-        for (size_t i = 0; i < total_devices; ++i) {
-            fds[nfds].fd = devices[i].fd;
-            fds[nfds].events = POLLIN;
+        for (size_t i = 0; i < total; ++i) {
+            fds[nfds].fd      = devs[i].fd;
+            fds[nfds].events  = POLLIN;
             fds[nfds].revents = 0;
+            devidx[nfds]      = i;
             nfds++;
         }
 
-        int ret = poll(fds, nfds, -1);
-        if (ret < 0) {
-            if (errno == EINTR) continue;
+        if (poll(fds, nfds, -1) < 0) {
+            if (errno == EINTR)
+                continue;
             perror("poll");
             break;
         }
 
-        /* Handle udev hotplug */
+        /* --- hotplug --- */
         if (mon_fd >= 0 && (fds[0].revents & POLLIN)) {
             struct udev_device *ud;
             while ((ud = udev_monitor_receive_device(mon)) != NULL) {
@@ -585,61 +700,65 @@ int main(int argc, char *argv[])
                 const char *devnode = udev_device_get_devnode(ud);
 
                 if (action && devnode &&
-                    strncmp(devnode, "/dev/input/event", 16) == 0)
-                {
+                    strncmp(devnode, "/dev/input/event", 16) == 0) {
                     if (strcmp(action, "add") == 0) {
-                        if (device_matches_filters(ud, &filt) &&
-                            has_middle_button(devnode))
-                        {
-                            add_device(devices, &total_devices, devnode);
-                        }
+                        if (device_matches(ud, &filt) && has_middle_button(devnode))
+                            add_device(devs, &total, devnode);
                     } else if (strcmp(action, "remove") == 0) {
-                        ssize_t idx = find_device_idx(devices, total_devices, devnode);
+                        ssize_t idx = find_device_idx(devs, total, devnode);
                         if (idx >= 0) {
                             fprintf(stderr, "Device removed: %s\n", devnode);
-                            remove_device(devices, &total_devices, (size_t)idx);
+                            remove_device(devs, &total, (size_t)idx);
                         }
                     }
                 }
-
                 udev_device_unref(ud);
             }
+            /* The device list may have changed; rebuild the poll set. */
+            continue;
         }
 
-        /* Handle input events */
-        size_t base = (mon_fd >= 0) ? 1 : 0;
-        for (size_t i = 0; i < total_devices; ++i) {
-            if (!(fds[base + i].revents & POLLIN)) continue;
+        /* --- input events --- */
+        memset(dead, 0, sizeof(dead));
 
-            struct input_event evbuf[32];
-            ssize_t nbytes = read(devices[i].fd, evbuf, sizeof(evbuf));
+        for (nfds_t k = base; k < nfds; ++k) {
+            struct input_event evbuf[64];
+            size_t i = devidx[k];
+            ssize_t nbytes;
+
+            if (fds[k].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                dead[i] = 1;
+                continue;
+            }
+            if (!(fds[k].revents & POLLIN))
+                continue;
+
+            nbytes = read(devs[i].fd, evbuf, sizeof(evbuf));
             if (nbytes < 0) {
-                if (errno == EAGAIN || errno == EINTR) continue;
-
-                /* If the device disappears without us seeing a udev remove */
-                if (errno == ENODEV || errno == ENXIO || errno == EIO) {
-                    fprintf(stderr, "Device vanished: %s\n", devices[i].path);
-                    remove_device(devices, &total_devices, i);
-                    i--; /* array compacted; re-check this index */
+                if (errno == EAGAIN || errno == EINTR)
                     continue;
-                }
-
-                perror("read");
-                running = 0;
-                break;
+                fprintf(stderr, "%s: %s\n", devs[i].path, strerror(errno));
+                dead[i] = 1;
+                continue;
             }
 
-            size_t evcnt = (size_t)nbytes / sizeof(struct input_event);
-            for (size_t j = 0; j < evcnt; ++j)
-                process_trackpoint(&devices[i], &evbuf[j]);
+            for (size_t j = 0; j < (size_t)nbytes / sizeof(struct input_event); ++j)
+                process_event(&devs[i], &evbuf[j]);
+        }
+
+        /* Remove in descending order: remove_device() swaps in the last entry. */
+        for (size_t i = total; i-- > 0; ) {
+            if (dead[i]) {
+                fprintf(stderr, "Dropping %s\n", devs[i].path);
+                remove_device(devs, &total, i);
+            }
         }
     }
 
-    cleanup_all(devices, &total_devices);
-
-    if (mon) udev_monitor_unref(mon);
+done:
+    cleanup_all(devs, &total);
+    if (mon)  udev_monitor_unref(mon);
     if (udev) udev_unref(udev);
-
     if (filt.have_regex) regfree(&filt.regex);
 
     return EXIT_SUCCESS;
