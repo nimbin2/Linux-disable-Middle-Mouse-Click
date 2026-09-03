@@ -57,6 +57,7 @@
 /* -----------------------------------------------------------------
  *  Constants
  * ----------------------------------------------------------------- */
+#define PROG_VERSION        "1.1.0"
 #define MAX_DEVICES         32
 #define UINPUT_NAME_PREFIX  "middle-disable: "
 #define HI_RES_PER_DETENT   120     /* kernel ABI: 120 units == one click */
@@ -69,12 +70,14 @@ struct options {
     int threshold;      /* raw REL units per wheel detent (higher = slower) */
     int natural;        /* invert scroll direction */
     int hscroll;        /* horizontal scrolling enabled */
+    int pointing_stick; /* tag clone as INPUT_PROP_POINTING_STICK */
 };
 
 static struct options opts = {
-    .threshold = DEFAULT_THRESHOLD,
-    .natural   = 0,
-    .hscroll   = 1,
+    .threshold      = DEFAULT_THRESHOLD,
+    .natural        = 0,
+    .hscroll        = 1,
+    .pointing_stick = 1,
 };
 
 /* -----------------------------------------------------------------
@@ -255,12 +258,14 @@ static int create_uinput(struct device *dev)
         ioctl(dev->ufd, UI_SET_EVBIT, EV_SYN) < 0)
         goto fail;
 
+    /* BTN_MIDDLE is declared but never emitted. It must be declared:
+     * libinput enables middle-button emulation on any pointer without a
+     * middle button, and that emulation buffers and re-times the left and
+     * right button events, which breaks modifier+right-drag gestures. */
     if (ioctl(dev->ufd, UI_SET_KEYBIT, BTN_LEFT)   < 0 ||
-        ioctl(dev->ufd, UI_SET_KEYBIT, BTN_RIGHT)  < 0)
+        ioctl(dev->ufd, UI_SET_KEYBIT, BTN_RIGHT)  < 0 ||
+        ioctl(dev->ufd, UI_SET_KEYBIT, BTN_MIDDLE) < 0)
         goto fail;
-
-    /* BTN_MIDDLE is deliberately NOT declared: the clone has no middle
-     * button at all, so nothing downstream can synthesise a paste. */
 
     if (ioctl(dev->ufd, UI_SET_RELBIT, REL_X)             < 0 ||
         ioctl(dev->ufd, UI_SET_RELBIT, REL_Y)             < 0 ||
@@ -273,7 +278,8 @@ static int create_uinput(struct device *dev)
     /* Advertise as a pointing stick so libinput applies TrackPoint
      * acceleration instead of generic mouse acceleration. */
 #ifdef INPUT_PROP_POINTING_STICK
-    ioctl(dev->ufd, UI_SET_PROPBIT, INPUT_PROP_POINTING_STICK);
+    if (opts.pointing_stick)
+        ioctl(dev->ufd, UI_SET_PROPBIT, INPUT_PROP_POINTING_STICK);
 #endif
 #ifdef INPUT_PROP_POINTER
     ioctl(dev->ufd, UI_SET_PROPBIT, INPUT_PROP_POINTER);
@@ -541,6 +547,11 @@ static void usage(const char *prog)
         "  -n, --natural        Invert scroll direction.\n"
         "      --no-hscroll     Disable horizontal scrolling.\n"
         "\n"
+        "Compatibility:\n"
+        "      --no-pointing-stick  Do not tag the clone as a pointing stick\n"
+        "                       (use if pointer acceleration feels wrong).\n"
+        "\n"
+        "  -V, --version        Show version.\n"
         "  -h, --help           Show this help.\n"
         "\n"
         "Build:\n"
@@ -559,6 +570,8 @@ int main(int argc, char *argv[])
         {"vendor",     required_argument, NULL,  3 },
         {"product",    required_argument, NULL,  4 },
         {"no-hscroll", no_argument,       NULL,  5 },
+        {"no-pointing-stick", no_argument, NULL, 6 },
+        {"version",    no_argument,       NULL, 'V'},
         {"help",       no_argument,       NULL, 'h'},
         {0, 0, 0, 0}
     };
@@ -581,7 +594,7 @@ int main(int argc, char *argv[])
 
     memset(&filt, 0, sizeof(filt));
 
-    for (int c; (c = getopt_long(argc, argv, "d:t:nh", long_opts, NULL)) != -1; ) {
+    for (int c; (c = getopt_long(argc, argv, "d:t:nVh", long_opts, NULL)) != -1; ) {
         switch (c) {
         case 'd':
             if (explicit_cnt >= MAX_DEVICES) {
@@ -604,7 +617,11 @@ int main(int argc, char *argv[])
         case  2:  match_regex = optarg;  break;
         case  3:  filt.vendor_id = optarg;  break;
         case  4:  filt.product_id = optarg; break;
-        case  5:  opts.hscroll = 0;      break;
+        case  5:  opts.hscroll = 0;         break;
+        case  6:  opts.pointing_stick = 0;  break;
+        case 'V':
+            printf("middle_button_disable %s\n", PROG_VERSION);
+            return EXIT_SUCCESS;
         case 'h':
         default:
             usage(argv[0]);
